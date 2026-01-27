@@ -554,11 +554,11 @@ system_audit() {
     log_message "Installed colorized-logs package"
 
     echo -e "${CYAN}Running system audit...${NC}"
-    lynis audit system | ansi2html -l > /var/log/lynis-report.html
-    log_message "Lynis report created at /var/log/lynis-report.html"
+    lynis audit system | ansi2html -l > "$USER_HOME/lynis-report.html"
+    log_message "Lynis report created at $USER_HOME/lynis-report.html"
 
     echo -e "${GREEN}${BOLD}System audit completed!${NC}"
-    echo -e "${CYAN}Report saved to: /var/log/lynis-report.html${NC}"
+    echo -e "${CYAN}Report saved to: $USER_HOME/lynis-report.html${NC}"
 
     apt purge --auto-remove lynis -y
     apt purge --auto-remove colorized-logs -y
