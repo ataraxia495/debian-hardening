@@ -14,6 +14,18 @@ NC='\033[0m'
 # Configuration file
 CONF_FILE="configuration.conf"
 
+# Detect if Docker is running on the host
+check_docker_host() {
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        if docker ps -q >/dev/null 2>&1 || docker network ls -q >/dev/null 2>&1; then
+            export DOCKER_HOST_MODE=true
+            return 0
+        fi
+    fi
+    export DOCKER_HOST_MODE=false
+    return 1
+}
+
 # Banner
 print_banner() {
     clear
@@ -214,21 +226,21 @@ EOF
     fi
 
     echo ""
-    echo "Port                    -> ${PORT}"
-    echo "PermitRootLogin         -> no"
-    echo "MaxAuthTries            -> 3"
-    echo "MaxSessions             -> 2"
-    echo "LoginGraceTime          -> 60"
-    echo "ClientAliveInterval     -> 300"
-    echo "ClientAliveCountMax     -> 2"
-    echo "TCPKeepAlive            -> no"
-    echo "X11Forwarding           -> no"
-    echo "AllowAgentForwarding    -> no"
-    echo "AllowTcpForwarding      -> no"
-    echo "PermitEmptyPasswords    -> no"
-    echo "IgnoreRhosts            -> yes"
-    echo "HostbasedAuthentication -> no"
-    echo "LogLevel                -> VERBOSE"
+    echo "Port                    22 -> ${PORT}"
+    echo "PermitRootLogin         prohibit-password -> no"
+    echo "MaxAuthTries            6 -> 3"
+    echo "MaxSessions             10 -> 2"
+    echo "LoginGraceTime          2m -> 60"
+    echo "ClientAliveInterval     0 -> 300"
+    echo "ClientAliveCountMax     3 -> 2"
+    echo "TCPKeepAlive            yes -> no"
+    echo "X11Forwarding           yes -> no"
+    echo "AllowAgentForwarding    yes -> no"
+    echo "AllowTcpForwarding      yes -> no"
+    echo "PermitEmptyPasswords    no -> no"
+    echo "IgnoreRhosts            yes -> yes"
+    echo "HostbasedAuthentication no -> no"
+    echo "LogLevel                INFO -> VERBOSE"
     echo ""
 
     log_section "$SECTION_LOG" "END: SSH hardening completed."
@@ -241,26 +253,34 @@ EOF
 # ---------------------------------------------------
 firewall_hardening() {
     local SECTION_LOG="$LOG_DIR/firewall-hardening.log"
-
     log_section "$SECTION_LOG" "═══════════════════════════════════════════════════════════════"
     log_section "$SECTION_LOG" "FIREWALL HARDENING - $(date '+%d-%m-%Y %H:%M:%S')"
     log_section "$SECTION_LOG" "═══════════════════════════════════════════════════════════════"
     log_summary "Started firewall hardening."
 
-    if ! confirm_action "Firewall Hardening" "This will install nftables, reset rules, deny incoming by default, and allow SSH port ${PORT}."; then
+    # Check for Docker on Host
+    check_docker_host
+
+    local docker_warning=""
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        docker_warning="\n\n${YELLOW}Docker detected! Rules will be adjusted to preserve container connectivity.${NC}"
+    fi
+
+    if ! confirm_action "Firewall Hardening" "This will install nftables, reset rules, deny incoming by default, and allow SSH port ${PORT}.${docker_warning}"; then
         log_section "$SECTION_LOG" "User cancelled firewall hardening."
         return 1
     fi
 
     log_section "$SECTION_LOG" "START: Applying firewall hardening."
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        log_section "$SECTION_LOG" "Docker Host Mode detected - applying compatible rules."
+    fi
 
-    # Saving original config
     if [[ ! -f /etc/nftables.conf.old ]]; then
         cp /etc/nftables.conf /etc/nftables.conf.old
         log_section "$SECTION_LOG" "Saved original nftables configuration file: /etc/nftables.conf.old"
     fi
 
-    # Backup
     if [[ ! -f /etc/nftables.conf.backup ]]; then
         cp /etc/nftables.conf /etc/nftables.conf.backup 2>/dev/null
         log_section "$SECTION_LOG" "Created backup: /etc/nftables.conf.backup"
@@ -269,10 +289,10 @@ firewall_hardening() {
         log_section "$SECTION_LOG" "Overwrote backup: /etc/nftables.conf.backup"
     fi
 
-    # Install
     if ! command -v nft >/dev/null 2>&1; then
         apt-get update && apt-get install -y nftables && log_section "$SECTION_LOG" "Installed nftables."
     fi
+
     systemctl enable --now nftables 2>/dev/null && log_section "$SECTION_LOG" "nftables service enabled and started."
 
     cat > /etc/nftables.conf << 'EOF'
@@ -280,9 +300,55 @@ flush ruleset
 include "/etc/nftables.d/*.nft"
 EOF
 
-    # Create nftables configuration content
     mkdir -p /etc/nftables.d
-    cat > /etc/nftables.d/99-hardening.nft << EOF
+
+    # Generate rules based on Docker status
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        cat > /etc/nftables.d/99-hardening.nft << EOF
+#!/usr/sbin/nft -f
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ct state established,related accept
+        tcp dport ${PORT} ct state new accept
+
+        # Allow common container ports
+        tcp dport 80 ct state new accept
+        tcp dport 443 ct state new accept
+        tcp dport 3001 ct state new accept
+
+        icmp type echo-request limit rate 5/second accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        # Allow Docker bridge traffic
+        iif docker0 accept
+        oif docker0 accept
+        ct state established,related accept
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+        oif lo accept
+    }
+}
+
+# Preserve Docker NAT
+table ip nat {
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+    }
+}
+EOF
+        log_section "$SECTION_LOG" "Created Docker-compatible nftables configuration."
+    else
+        cat > /etc/nftables.d/99-hardening.nft << EOF
 table inet filter {
     chain input {
         type filter hook input priority 0; policy drop;
@@ -300,19 +366,18 @@ table inet filter {
     }
 }
 EOF
+        log_section "$SECTION_LOG" "Created standard nftables configuration."
+    fi
 
     chmod 600 /etc/nftables.d/99-hardening.nft
-
     log_section "$SECTION_LOG" "Created nftables configuration: /etc/nftables.d/99-hardening.nft"
 
-    # Apply the configuration
     nft -f /etc/nftables.conf && log_section "$SECTION_LOG" "Applied nftables configuration from file."
     systemctl restart nftables && log_section "$SECTION_LOG" "nftables service restarted."
 
     log_section "$SECTION_LOG" "END: Firewall hardening completed."
     log_summary "Firewall hardening completed."
     log_section_and_echo "$SECTION_LOG" "${GREEN}${BOLD}" "Firewall hardening completed successfully!"
-
     echo -e "${CYAN}Current ruleset:${NC}"
     nft list ruleset
 }
@@ -349,9 +414,9 @@ dns_hardening() {
     mkdir -p /etc/systemd/resolved.conf.d && log_section "$SECTION_LOG" "Created /etc/systemd/resolved.conf.d directory."
 
     # Create DNS configuration
-    cat > /etc/systemd/resolved.conf.d/00-dns.conf << 'EOF'
+    cat > /etc/systemd/resolved.conf.d/00-dns.conf << EOF
 [Resolve]
-DNS=1.1.1.1 1.0.0.1
+DNS=${DNS}
 DNSOverTLS=yes
 DNSSEC=yes
 Cache=yes
@@ -363,10 +428,10 @@ EOF
     systemctl restart systemd-resolved && log_section "$SECTION_LOG" "Restarted systemd-resolved service."
 
     echo ""
-    echo "DNS        -> 1.1.1.1 1.0.0.1"
-    echo "DNSOverTLS -> yes"
-    echo "DNSSEC     -> yes"
-    echo "Cache      -> yes"
+    echo "DNS        not set -> ${DNS}"
+    echo "DNSOverTLS no -> yes"
+    echo "DNSSEC     no -> yes"
+    echo "Cache      yes -> yes"
     echo ""
 
     log_section "$SECTION_LOG" "END: DNS hardening completed."
@@ -652,20 +717,29 @@ EOF
 # -------------------------------------------------------
 kernel_hardening() {
     local SECTION_LOG="$LOG_DIR/kernel-hardening.log"
-
     log_section "$SECTION_LOG" "═══════════════════════════════════════════════════════════════"
     log_section "$SECTION_LOG" "KERNEL HARDENING - $(date '+%d-%m-%Y %H:%M:%S')"
     log_section "$SECTION_LOG" "═══════════════════════════════════════════════════════════════"
     log_summary "Started kernel hardening."
 
-    if ! confirm_action "Kernel Hardening" "This will modify kernel parameters in /etc/sysctl.d/99-custom.conf, including network security, BPF restrictions, and other kernel security settings."; then
+    # Check for Docker on Host
+    check_docker_host
+
+    local docker_warning=""
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        docker_warning="\n\n${YELLOW}Docker detected! Kernel params will be adjusted for NAT compatibility.${NC}"
+    fi
+
+    if ! confirm_action "Kernel Hardening" "This will modify kernel parameters in /etc/sysctl.d/99-custom.conf, including network security, BPF restrictions, and other kernel security settings.${docker_warning}"; then
         log_section "$SECTION_LOG" "User cancelled kernel hardening."
         return 1
     fi
 
     log_section "$SECTION_LOG" "START: Applying kernel hardening changes."
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        log_section "$SECTION_LOG" "Docker Host Mode detected - applying compatible sysctl rules."
+    fi
 
-    # Check for existing custom config, create if not
     if [[ ! -f /etc/sysctl.d/99-custom.conf ]]; then
         touch /etc/sysctl.d/99-custom.conf
         log_section "$SECTION_LOG" "Created /etc/sysctl.d/99-custom.conf"
@@ -673,46 +747,87 @@ kernel_hardening() {
         log_section "$SECTION_LOG" "Custom kernel config already exists at /etc/sysctl.d/99-custom.conf."
     fi
 
-    # Backup existing configuration
     if [[ ! -f /etc/sysctl.d/99-custom.conf.backup ]]; then
         cp /etc/sysctl.d/99-custom.conf /etc/sysctl.d/99-custom.conf.backup
         log_section "$SECTION_LOG" "Created kernel config backup: /etc/sysctl.d/99-custom.conf.backup"
+    elif confirm_action "Overwrite Kernel Backup" "This will overwrite your existing backup."; then
+        cp /etc/sysctl.d/99-custom.conf /etc/sysctl.d/99-custom.conf.backup
+        log_section "$SECTION_LOG" "Overwrote kernel config backup: /etc/sysctl.d/99-custom.conf.backup"
     else
-        if confirm_action "Overwrite Kernel Backup" "This will overwrite your existing backup."; then
-            cp /etc/sysctl.d/99-custom.conf /etc/sysctl.d/99-custom.conf.backup
-            log_section "$SECTION_LOG" "Overwrote kernel config backup: /etc/sysctl.d/99-custom.conf.backup"
-        else
-            log_section "$SECTION_LOG" "Using existing kernel backup without overwriting."
-        fi
+        log_section "$SECTION_LOG" "Using existing kernel backup without overwriting."
     fi
 
-    # Creating file with kernel hardening parameters
     log_section "$SECTION_LOG" "Applying kernel hardening parameters to /etc/sysctl.d/99-custom.conf."
-    cat > /etc/sysctl.d/99-custom.conf << EOF
+
+    if [[ "$DOCKER_HOST_MODE" == "true" ]]; then
+        # Docker-compatible settings
+        cat > /etc/sysctl.d/99-custom.conf << EOF
 # Kernel hardening parameters - Applied $(date '+%d-%m-%Y %H:%M:%S')
 
-# TTY security
 dev.tty.ldisc_autoload = 0
-
-# Filesystem protection
 fs.protected_fifos = 2
-
-# Kernel pointer restrictions
 kernel.kptr_restrict = 2
-
-# SysRq key disable
 kernel.sysrq = 0
-
-# Unprivileged BPF disable
 kernel.unprivileged_bpf_disabled = 1
-
-# YAMA ptrace scope
 kernel.yama.ptrace_scope = 1
-
-# BPF JIT hardening
 net.core.bpf_jit_harden = 2
 
-# IPv4 security
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.accept_redirects = 0
+
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_redirects = 0
+
+net.bridge.bridge-nf-call-iptables = 0
+net.bridge.bridge-nf-call-ip6tables = 0
+net.bridge.bridge-nf-call-arptables = 0
+EOF
+        log_section "$SECTION_LOG" "Created Docker-compatible kernel configuration."
+
+        echo ""
+        echo "dev.tty.ldisc_autoload                 not set -> 0"
+        echo "fs.protected_fifos                     1 -> 2"
+        echo "kernel.kptr_restrict                   not set -> 2"
+        echo "kernel.sysrq                           0x01b6 -> 0"
+        echo "kernel.unprivileged_bpf_disabled       not set -> 1"
+        echo "kernel.yama.ptrace_scope               not set -> 1"
+        echo "net.core.bpf_jit_harden                not set -> 2"
+        echo "net.ipv4.conf.default.log_martians     not set -> 1"
+        echo "net.ipv4.conf.all.rp_filter            not set -> 2"
+        echo "net.ipv4.conf.default.rp_filter        2 -> 2"
+        echo "net.ipv4.conf.all.accept_redirects     not set -> 0"
+        echo "net.ipv4.conf.all.send_redirects       not set -> 0"
+        echo "net.ipv4.conf.all.accept_source_route  not set -> 0"
+        echo "net.ipv4.tcp_syncookies                not set -> 1"
+        echo "net.ipv4.conf.all.log_martians         not set -> 1"
+        echo "net.ipv4.conf.default.accept_redirects not set -> 0"
+        echo "net.ipv6.conf.all.accept_redirects     not set -> 0"
+        echo "net.ipv6.conf.all.accept_source_route  not set -> 0"
+        echo "net.ipv6.conf.default.accept_redirects not set -> 0"
+        echo "net.bridge.bridge-nf-call-iptables     not set -> 0"
+        echo "net.bridge.bridge-nf-call-ip6tables    not set -> 0"
+        echo "net.bridge.bridge-nf-call-arptables    not set -> 0"
+        echo ""
+    else
+        cat > /etc/sysctl.d/99-custom.conf << EOF
+# Kernel hardening parameters - Applied $(date '+%d-%m-%Y %H:%M:%S')
+
+dev.tty.ldisc_autoload = 0
+fs.protected_fifos = 2
+kernel.kptr_restrict = 2
+kernel.sysrq = 0
+kernel.unprivileged_bpf_disabled = 1
+kernel.yama.ptrace_scope = 1
+net.core.bpf_jit_harden = 2
+
 net.ipv4.conf.default.log_martians = 1
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
@@ -723,45 +838,41 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.accept_redirects = 0
 
-# IPv6 security
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_redirects = 0
 EOF
+        log_section "$SECTION_LOG" "Created standard kernel configuration."
+        echo ""
+        echo "dev.tty.ldisc_autoload                 not set -> 0"
+        echo "fs.protected_fifos                     1 -> 2"
+        echo "kernel.kptr_restrict                   not set -> 2"
+        echo "kernel.sysrq                           0x01b6 -> 0"
+        echo "kernel.unprivileged_bpf_disabled       not set -> 1"
+        echo "kernel.yama.ptrace_scope               not set -> 1"
+        echo "net.core.bpf_jit_harden                not set -> 2"
+        echo "net.ipv4.conf.default.log_martians     not set -> 1"
+        echo "net.ipv4.conf.all.rp_filter            not set -> 1"
+        echo "net.ipv4.conf.default.rp_filter        2 -> 1"
+        echo "net.ipv4.conf.all.accept_redirects     not set -> 0"
+        echo "net.ipv4.conf.all.send_redirects       not set -> 0"
+        echo "net.ipv4.conf.all.accept_source_route  not set -> 0"
+        echo "net.ipv4.tcp_syncookies                not set -> 1"
+        echo "net.ipv4.conf.all.log_martians         not set -> 1"
+        echo "net.ipv4.conf.default.accept_redirects not set -> 0"
+        echo "net.ipv6.conf.all.accept_redirects     not set -> 0"
+        echo "net.ipv6.conf.all.accept_source_route  not set -> 0"
+        echo "net.ipv6.conf.default.accept_redirects not set -> 0"
+        echo ""
+    fi
+
     log_section "$SECTION_LOG" "Created /etc/sysctl.d/99-custom.conf with kernel hardening parameters."
 
-    # Apply the settings
     if sysctl -p /etc/sysctl.d/99-custom.conf > /dev/null 2>&1; then
         log_section "$SECTION_LOG" "Successfully applied kernel hardening parameters."
     else
         log_section "$SECTION_LOG" "WARNING: Some kernel parameters failed to apply (check dmesg for details)."
     fi
-
-    grep -v '^#' /etc/sysctl.d/99-custom.conf | grep -v '^$' | while read -r param; do
-        log_section "$SECTION_LOG" "  $param"
-    done
-
-    echo ""
-    echo "dev.tty.ldisc_autoload                 -> 0"
-    echo "fs.protected_fifos                     -> 2"
-    echo "kernel.kptr_restrict                   -> 2"
-    echo "kernel.sysrq                           -> 0"
-    echo "kernel.unprivileged_bpf_disabled       -> 1"
-    echo "kernel.yama.ptrace_scope               -> 1"
-    echo "net.core.bpf_jit_harden                -> 2"
-    echo "net.ipv4.conf.default.log_martians     -> 1"
-    echo "net.ipv4.conf.all.rp_filter            -> 1"
-    echo "net.ipv4.conf.default.rp_filter        -> 1"
-    echo "net.ipv4.conf.all.accept_redirects     -> 0"
-    echo "net.ipv4.conf.all.send_redirects       -> 0"
-    echo "net.ipv4.conf.all.accept_source_route  -> 0"
-    echo "net.ipv4.tcp_syncookies                -> 1"
-    echo "net.ipv4.conf.all.log_martians         -> 1"
-    echo "net.ipv4.conf.default.accept_redirects -> 0"
-    echo "net.ipv6.conf.all.accept_redirects     -> 0"
-    echo "net.ipv6.conf.all.accept_source_route  -> 0"
-    echo "net.ipv6.conf.default.accept_redirects -> 0"
-    echo ""
 
     log_section "$SECTION_LOG" "END: Kernel hardening completed."
     log_summary "Kernel hardening completed."
@@ -876,18 +987,17 @@ EOF
 
     echo ""
     echo "[DEFAULT]"
-    echo "bantime  -> 3600"
-    echo "findtime -> 300"
-    echo "maxretry -> 5"
-    #echo ""
+    echo "bantime  10m -> 3600"
+    echo "findtime 10m -> 300"
+    echo "maxretry 5 -> 5"
     echo "[sshd]"
-    echo "enabled  -> true"
-    echo "port     -> ${PORT}"
-    echo "filter   -> sshd"
-    echo "logpath  -> /var/log/auth.log"
-    echo "maxretry -> 3"
-    echo "bantime  -> 3600"
-    echo "findtime -> 300"
+    echo "enabled  not set -> true"
+    echo "port     ssh -> ${PORT}"
+    echo "filter   not set -> sshd"
+    echo "logpath  not set -> /var/log/auth.log"
+    echo "maxretry not set -> 3"
+    echo "bantime  not set -> 3600"
+    echo "findtime not set -> 300"
     echo ""
 
     log_section "$SECTION_LOG" "END: Fail2ban hardening completed."
@@ -1079,8 +1189,8 @@ backups_rollback() {
             1)
                 log_section "$SECTION_LOG" "User selected: Rollback SSH configuration."
                 # Check ssh config backup for existing
-                if [[ ! -f /etc/ssh/sshd_config.backup ]]; then
-                    log_section "$SECTION_LOG" "ERROR: No SSH backup found at /etc/ssh/sshd_config.backup."
+                if [[ ! -f /etc/ssh/sshd_config.d/99-hardening.conf.backup ]]; then
+                    log_section "$SECTION_LOG" "ERROR: No SSH backup found at /etc/ssh/sshd_config.d/99-hardening.conf.backup"
                     echo -e "${RED}No SSH backup found.${NC}"
                     read -rp "Press enter to continue."
                     continue
@@ -1091,8 +1201,8 @@ backups_rollback() {
                 fi
                 # Return ssh config from backup
                 log_section "$SECTION_LOG" "START: Restoring SSH configuration from backup."
-                cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-                log_section "$SECTION_LOG" "Restored SSH configuration from /etc/ssh/sshd_config.backup."
+                cp /etc/ssh/sshd_config.d/99-hardening.conf.backup /etc/ssh/sshd_config.d/99-hardening.conf
+                log_section "$SECTION_LOG" "Restored SSH configuration from /etc/ssh/sshd_config.d/99-hardening.conf.backup"
                 log_section "$SECTION_LOG" "Reloading SSH service."
                 systemctl reload ssh
                 log_section "$SECTION_LOG" "SSH service reloaded."
@@ -1358,10 +1468,13 @@ show_menu() {
 main() {
     check_root
     init_log
+    check_docker_host
+
     echo ""
     echo -e "${GREEN}${BOLD}Script initialized successfully!${NC}"
     echo -e "${CYAN}${BOLD}Distribution: $PRETTY_NAME${NC}"
     echo -e "${CYAN}Log file: $MAIN_LOG${NC}"
+    echo -e "${CYAN}Docker Host Mode: $DOCKER_HOST_MODE${NC}"
     echo ""
     read -rp "Press enter to continue."
     while true; do
